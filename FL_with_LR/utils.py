@@ -155,10 +155,6 @@ class LR:
         weight = self.weight
         bias = self.bias
         return (weight, bias)
-        # return {
-        #   'weight': self.weight,
-        #   'bias': self.bias
-        # }
 
 def scaling(df_num, cols):
     std_scaler = StandardScaler()  # 針對超異常的資料標準化成平均值為 0 ，標準差 1 的標準常態分佈

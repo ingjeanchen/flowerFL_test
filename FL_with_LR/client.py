@@ -17,24 +17,14 @@ if __name__ == "__main__":
     
     partition_id = np.random.choice(10)
     (X_train, y_train) = utils.partition(X_train, y_train, 10)[partition_id]
-    
-    # Create LogisticRegression Model
-    # model = LogisticRegression(
-    #     penalty="l2",
-    #     max_iter=1,  # local epoch
-    #     warm_start=True,  # prevent refreshing weights when fitting
-    # )
+
     n_features = X_train.shape[1]
     model = utils.LR(utils.BasicLR(n_features))
-
-    # Setting initial parameters, akin to model.compile for keras models
-    # utils.set_initial_params(model)
 
     # Define Flower client
     class Client(fl.client.NumPyClient):
         def get_parameters(self, config):  # type: ignore
             return utils.get_model_params(model)
-            # return model.state_dict()
 
         def fit(self, parameters, config):  # type: ignore
             utils.set_model_params(model, parameters)
@@ -52,7 +42,6 @@ if __name__ == "__main__":
 
         def evaluate(self, parameters, config):  # type: ignore
             utils.set_model_params(model, parameters)
-            # loss = log_loss(y_test, model.predict_proba(X_test))
             total_loss = []
             for x, y in zip(X_test, y_test):
                 out = model(x)
@@ -61,7 +50,6 @@ if __name__ == "__main__":
                 loss = out - y
                 total_loss.append(loss.item())
             loss = np.mean(total_loss)
-            # accuracy = model.score(X_test, y_test)
             accuracy = model.plain_accuracy(X_test, y_test)
             loss = float(loss)
             accuracy = float(accuracy)

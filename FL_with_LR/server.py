@@ -23,9 +23,7 @@ def get_evaluate_fn(model: LogisticRegression):
     # The `evaluate` function will be called after every round
     def evaluate(server_round, parameters: fl.common.NDArrays, config):
         # Update model with the latest parameters
-        # print('parameters to server : ', parameters)
         utils.set_model_params(model, parameters)
-        # loss = log_loss(y_test, model.predict_proba(X_test))
         total_loss = []
         for x, y in zip(X_test, y_test):
             out = model(x)
@@ -34,7 +32,7 @@ def get_evaluate_fn(model: LogisticRegression):
             loss = out - y
             total_loss.append(loss.item())
         loss = np.mean(total_loss)
-        # accuracy = model.score(X_test, y_test)
+
         accuracy = model.plain_accuracy(X_test, y_test)
         loss = float(loss)
         accuracy = float(accuracy)
@@ -46,7 +44,7 @@ def get_evaluate_fn(model: LogisticRegression):
 # Start Flower server for five rounds of federated learning
 if __name__ == "__main__":
     model = utils.LR(utils.BasicLR(48))     # 不確定要怎麼取得features的數量
-    # utils.set_initial_params(model)
+
     strategy = fl.server.strategy.FedAvg(
         min_available_clients=2,
         evaluate_fn=get_evaluate_fn(model),

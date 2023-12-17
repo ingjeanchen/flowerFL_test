@@ -3,6 +3,7 @@ from typing import Tuple, Union, List
 import numpy as np
 import pandas as pd
 import torch
+import pickle
 import tenseal as ts
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
@@ -210,3 +211,150 @@ def recv_all(sock: socket.socket, size: int):
                 raise RuntimeError("Failed to receive data")
             data += packet
         return data
+
+def send_chunked_data(socket: socket.socket, data):
+    CHUNK_SIZE = 1024
+    chunks = [data[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
+    for chunk in chunks:
+        socket.sendall(chunk)
+    socket.sendall(b'END')  # 發送結束的信號
+
+def receive_chunked_data(socket: socket.socket):
+    data = b''
+    while True:
+        chunk = socket.recv(1024)
+        if b'END' in chunk:
+            data += chunk.split(b'END')[0]
+            break
+        data += chunk
+    return data
+
+def receive_public_context(socket: socket.socket) -> ts.Context:
+    """ 
+    Get context size first and receive the public context. 
+    """
+    ctx_size = recv_size(socket)
+    print(f"Context size: {ctx_size}.\nReceiving context...")
+    ctx_data = recv_all(socket, ctx_size)
+
+    try:
+        # 傳 ack 給對方表示收到 context 了
+        socket.send(b'Received')
+        ctx = ts.context_from(ctx_data)
+        print("Context received!")
+    except:
+        socket.send(b'Fail')
+        raise Exception("cannot deserialize context")
+    return ctx
+
+def receive_parameters(socket: socket.socket, who_id: str, client_params=None, context=None, server_params=None, kgc_params=None):
+    got_weight = False
+    got_bias = False
+    try:
+        while not(got_weight and got_bias):
+            # 接收 prefix ，以區分 weight 和 bias
+            prefix = socket.recv(7).decode()  # 最長 prefix 是 "weight:"，所以接收 7 個字節
+            print("Got prefix", prefix, len(prefix))
+            if not prefix:
+                break
+
+            # 取得傳來的參數
+            params_size = int.from_bytes(socket.recv(4), 'big')
+            params_data = receive_chunked_data(socket)
+            params = pickle.loads(params_data)
+
+            if prefix.startswith('weight:'):
+                print(f"Received weight parameters (len: {params_size}) from {who_id}.")
+                
+                # server 處理 client 加密後的參數
+                if client_params and context:
+                    ckks_weight = ts.ckks_vector_from(context, params)
+                    client_params['weight'].append(ckks_weight) # 加入等待聚合的 weight list 中
+                
+                if server_params and context:
+                    ckks_weight = ts.ckks_vector_from(context, params)
+                    server_params['weight'] = ckks_weight.decrypt(context.secret_key())
+
+                if kgc_params:
+                    kgc_params['weight'] = params
+
+                socket.sendall(b'ACK_W')
+                got_weight = True
+
+            elif prefix.startswith('bias:'):
+                print(f"Received bias parameters (len: {params_size}) from {who_id}.")
+                
+                # server 處理 client 加密後的參數
+                if client_params and context:
+                    ckks_bias = ts.ckks_vector_from(context, params)
+                    client_params['bias'].append(ckks_bias) # 加入等待聚合的 bias list 中
+                
+                if server_params and context:
+                    ckks_bias = ts.ckks_vector_from(context, params)
+                    server_params['bias'] = ckks_bias.decrypt(context.secret_key())
+
+                if kgc_params:
+                    kgc_params['bias'] = params
+
+                socket.sendall(b'ACK_B')
+                got_bias = True
+            else:
+                print("Unknown prefix:", prefix)
+    
+    except Exception as e:
+        if who_id == 'server':
+            print(f"Error handling Server: {e}")
+        elif who_id == 'client':
+            print(f"Error interacting with KGC: {e}")
+        else:
+            print(f"Error handling Client {who_id}: {e}")
+
+    # kgc receive from server
+    if who_id == 'server':
+        print(f"Encrypted parameters are successfully received.")
+
+    # client receive from kgc
+    elif who_id == 'client':
+        print(f"Updated parameters are successfully received.")
+
+    # server receive from clients
+    else: 
+        print(f"Client {who_id}'s parameters are successfully received.")
+
+def send_updates(socket: socket.socket, role: str, weight, bias, to_encrypt=True, context=None, cli_id=''):
+        # 加密參數
+        if to_encrypt and context:
+            weight = ts.ckks_vector(context, weight)
+            bias = ts.ckks_vector(context, bias)
+
+        # 添加前綴以區分 weight 和 bias
+        weight_prefix = b'weight:'
+        bias_prefix = b'bias:'
+
+        # 將 weight 和 bias 序列化為字節流
+        weight_data = pickle.dumps(weight.serialize())
+        bias_data = pickle.dumps(bias.serialize())
+        
+        ack_msg = {weight_prefix: b'ACK_W', bias_prefix: b'ACK_B'}
+        # 先傳送前綴和大小，再傳數據
+        for prefix, data in [(weight_prefix, weight_data), (bias_prefix, bias_data)]:
+            print(f"Sending params {prefix.decode()[:-1]} ...")
+            socket.send(prefix + len(data).to_bytes(4, 'big'))
+            send_chunked_data(socket, data)
+            ack = socket.recv(5)
+
+            param_succ_msg = {'client': f"Server received {prefix.decode()[:-1]}.", 
+                       'server': f"KGC received {prefix.decode()[:-1]}.",
+                       'kgc': f"Client {cli_id} received updated {prefix.decode()[:-1]}."
+                        }
+
+            if ack != ack_msg[prefix]:
+                print(f"Error: Incorrect ACK received for {prefix.decode()}")
+            else:
+                print(param_succ_msg[role])
+
+        succ_msg = {'client': "Encrypted params sent to server.", 
+                    'server': "Aggregated params sent to KGC.",
+                    'kgc': f'Updated parameters sent to Client {cli_id}.'
+                    }
+        print(succ_msg[role])

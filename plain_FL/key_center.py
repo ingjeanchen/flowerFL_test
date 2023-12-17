@@ -3,16 +3,26 @@ import time
 import tenseal as ts
 import socket
 import pickle
+import utils
 import threading
+import json
 
 class KeyGenCenter():
-    def __init__(self):
-        self.context = None
-        self.public_key = None
-        self.secret_key = None
+    def __init__(self, serv_host: str, serv_port: int, cli_host: str, cli_port: int, num_rounds: int, num_clients: int):
+        self.serv_host = serv_host
+        self.serv_port = serv_port
+        self.cli_host = cli_host
+        self.cli_port = cli_port
+
+        self.num_rounds = num_rounds
+        self.num_clients = num_clients
         self.cli_sockets = {}
+        self.server_params = {'weight': None, 'bias': None}
         self.lock = threading.Lock()
         self.sock = None
+        self.round_complete_event = threading.Event()
+        self.clients_completed = 0
+        self.server_completed = False
 
     def create_context(self) -> ts.Context:
         poly_mod_degree = 8192  # 定義要使用的多項式模數次數，必須是2的冪次方，會影響加密效率和安全性
@@ -25,9 +35,28 @@ class KeyGenCenter():
         )    
         context.global_scale = 2 ** 25
         context.generate_galois_keys()
-        self.context = context
-        self.public_key = context.public_key()
-        self.secret_key = context.secret_key()
+        return context
+
+    def reset_for_new_round(self):
+        with self.lock:
+            self.clients_completed = 0
+            self.server_completed = False
+            self.round_complete_event.clear()
+
+    def check_round_completion(self):
+        with self.lock:
+            if self.clients_completed == self.num_clients and self.server_completed:
+                self.round_complete_event.set()
+
+    def mark_client_as_completed(self):
+        with self.lock:
+            self.clients_completed += 1
+            self.check_round_completion()
+
+    def mark_as_server_completed(self):
+        with self.lock:
+            self.server_completed = True
+            self.check_round_completion()
 
     def send_public_context(self, conn: socket.socket, cli_id: str):
         ctx = self.context
@@ -36,81 +65,86 @@ class KeyGenCenter():
         print(f"Sending context size: {ctx_size}...")
         conn.send(ctx_size.to_bytes(4, 'big'))
         print(f"Sending context to {cli_id}...")
-        print("Context sent!")
+
         conn.sendall(ctx_data)
         ack = conn.recv(16)
         ack = ack.decode()
         if(ack == 'Failed'):
             raise("send context failed")
         else:
-            print(f"Client {cli_id} received the context")
+            if cli_id == 'server':
+                print("Server received the context")
+            else:
+                print(f"Client {cli_id} received the context")
+    
+    def send_updated_params_to_clients(self):
+        print(self.cli_sockets)
+        for client_id, socket in self.cli_sockets.items():
+            print(f"Sending updated params to Client {client_id}...")
+            utils.send_updates(socket, 'kgc', self.server_params['weight'], 
+                               self.server_params['bias'], to_encrypt=False, cli_id=client_id)
 
-    def handle_client(self, cli_socket):
+    def handle_client(self, cli_socket, client_id):
         with self.lock:
             try:
-                # 得到 client 的 id
-                client_id = cli_socket.recv(32)
-                client_id = pickle.loads(client_id)
-                self.cli_sockets[client_id] = cli_socket
-                print(f"Client ID [{client_id}] connected.")
-
                 self.send_public_context(cli_socket, client_id)
+                self.mark_client_as_completed()
             except EOFError as e:
                 logging.error(f"EOFError: {e}")
             except Exception as e:
                 logging.error(f"Error in handle_client: {e}")
 
     def handle_server(self, serv_sock: socket.socket):
-        # 接收 prefix ，以區分 weight 和 bias
-        prefix = serv_sock.recv(7)  # 最長 prefix 是 "weight:"，所以接收 7 個字節
-        prefix = prefix.decode()
+        self.send_public_context(serv_sock, 'server')
+        utils.receive_parameters(serv_sock, 'server', context=self.context, server_params=self.server_params)
+        
+        # do averaging
+        self.server_params['weight'] = [w / self.num_clients for w in self.server_params['weight']]
+        self.server_params['bias'] = [w / self.num_clients for w in self.server_params['bias']]
 
-        if prefix == 'weight:':
-            # 取得傳來的 weight 參數
-            params_size = serv_sock.recv(4)
-            params_size = int.from_bytes(params_size, 'big')
-            params_data = serv_sock.recv(params_size)
-            weight_params = pickle.loads(params_data)
+        self.mark_as_server_completed()
+    
+    def start_rounds(self):
+        for round_number in range(1, self.num_rounds + 1):
+            print(f"Round {round_number} started")
+            self.reset_for_new_round()
+            self.context = self.create_context()  # Generate new keys for the round
 
-            # 解密 weight 參數
-            weight_params.decrypt()
-            print("Received weight parameters:", weight_params)
-            # TODO: 將參數除以 client 數量
-
-        elif prefix == 'bias:':
-            # 取得傳來的 bias 參數
-            params_size = serv_sock.recv(4)
-            params_size = int.from_bytes(params_size, 'big')
-            params_data = serv_sock.recv(params_size)
-            bias_params = pickle.loads(params_data)
-
-            # 解密 bias 參數
-            bias_params.decrypt()
-            print("Received bias parameters:", bias_params)
-            # TODO: 將參數除以 client 數量
-            
-        else:
-            print("Unknown prefix:", prefix)
+            self.round_complete_event.wait()  # Wait for all clients and server to complete the round
+            print("hello")
+            self.send_updated_params_to_clients()
+            print(f"Round {round_number} completed")
 
     def start_client_listener(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind(('localhost', 8081))
-        self.sock.listen()
+        self.sock.bind((self.cli_host, self.cli_port))
+        self.sock.listen(self.num_clients)
 
         print("Key Generation Center (KGC) is running...")
         print("Waiting for clients to connect...")
 
-        while True:
-            cli_socket, _ = self.sock.accept()            
-
-            # 使用多線程處理客戶端的連接
-            cli_thread = threading.Thread(target=self.handle_client, args=(cli_socket,))
+        while len(self.cli_sockets) < self.num_clients:
+            cli_socket, _ = self.sock.accept()
+            client_id = cli_socket.recv(32)
+            client_id = pickle.loads(client_id)
+            self.cli_sockets[client_id] = cli_socket
+            print(f"Client ID [{client_id}] connected.")
+        
+        for cli_id, cli_socket in self.cli_sockets.items():
+            # Handle client connections in separate threads
+            cli_thread = threading.Thread(target=self.handle_client, args=(cli_socket, cli_id,))
             cli_thread.start()
+
+        # Wait for all clients to complete their initial setup
+        with self.lock:
+            while self.clients_completed < self.num_clients:
+                time.sleep(1)
+
 
     def start_server_listener(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind(('localhost', 8082))
-        self.server_socket.listen()
+        self.server_socket.bind((self.serv_host, self.serv_port))
+        self.server_socket.listen(10)
 
         print("KGC listening for Server connection...")
 
@@ -120,6 +154,21 @@ class KeyGenCenter():
             serv_thread = threading.Thread(target=self.handle_server, args=(server_socket,))
             serv_thread.start()
 
+    def start(self):
+        # Starting client and server listeners
+        client_listener_thread = threading.Thread(target=self.start_client_listener)
+        server_listener_thread = threading.Thread(target=self.start_server_listener)
+
+        client_listener_thread.start()
+        server_listener_thread.start()
+
+        self.start_rounds()
+
+        # Stopping the Key Gen Center
+        self.stop()
+        client_listener_thread.join()
+        server_listener_thread.join()
+
     def stop(self):
         self.server_socket.close()
         self.sock.close()
@@ -127,26 +176,13 @@ class KeyGenCenter():
             sock.close()
 
 if __name__ == '__main__':
-    kgc = KeyGenCenter()
-    kgc.create_context()
-
-    # 用 thread 啟動 Client 和 Server 平行監聽
-    client_listener_thread = threading.Thread(target=kgc.start_client_listener)
-    server_listener_thread = threading.Thread(target=kgc.start_server_listener)
-
-    client_listener_thread.start()
-    server_listener_thread.start()
+    with open('config.json', 'r') as config_file:
+        config = json.load(config_file)
     
-    num_rounds = 10 # TODO: 需要再用 config 設定
-    num_clients = 1 # TODO: 需要再用 config 設定
+    kgc_config = config['kgc']
+    train_config = config['train_config']
 
-    for round in range(num_rounds):
-        print(f"Round {round + 1}")
-        kgc.create_context()  # Generate new keys for each round
-        time.sleep(1)  # Time for clients to connect and receive the context
-
-    # 結束 Key Gen Center
-    kgc.stop()
-
-    client_listener_thread.join()
-    server_listener_thread.join()
+    kgc = KeyGenCenter(kgc_config['server_host'], kgc_config['server_port'],
+                       kgc_config['client_host'], kgc_config['client_port'],
+                       train_config['num_rounds'], train_config['num_clients'])
+    kgc.start()

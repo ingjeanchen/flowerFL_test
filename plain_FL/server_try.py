@@ -1,19 +1,19 @@
 import socket
 import pickle
 import threading
+import utils
 import tenseal as ts
 import json
-import utils
 from typing import Dict, List
 
 class Server:
-    def __init__(self, cli_host: str, cli_port: int, kgc_host: str, kgc_port: int, num_rounds: int, num_clients: int):
+    def __init__(self, cli_host: str, cli_port: int, num_rounds: int, num_clients: int):
         self.cli_host = cli_host
         self.cli_port = cli_port
-        self.kgc_host = kgc_host
-        self.kgc_port = kgc_port
         self.num_rounds = num_rounds
         self.num_clients = num_clients
+        self.client_weights = []
+        self.client_biases = []
 
     def init_sockets(self):
         self.cli_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -22,34 +22,52 @@ class Server:
         accept_timeout = 20
         self.cli_socket.settimeout(accept_timeout)
 
-        self.kgc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.kgc_socket.connect((self.kgc_host, self.kgc_port))  # 連接到 KGC   
-
     def aggregate_encrypted_parameters(self, parameters_list: List[ts.CKKSVector]) -> ts.CKKSVector:
         aggregated = parameters_list[0]
         for params in parameters_list[1:]:
             aggregated += params
         return aggregated
 
-    def send_encrypted_updates(self, weight, bias):
-        utils.send_updates(self.kgc_socket, 'server', weight, bias, to_encrypt=False)
-
-    def fetch_context(self) -> ts.Context:
-        """ 
-        Get context size first and receive the public context from kgc. 
-        """
-        self.context = utils.receive_public_context(self.kgc_socket)
-
     def handle_client(self, cli_sock: socket.socket, cli_id: str):
-        utils.receive_parameters(cli_sock, cli_id, self.client_params, self.context)
+        got_weight = False
+        got_bias = False
+        try:
+            while not(got_weight and got_bias):
+                # 接收 prefix ，以區分 weight 和 bias
+                prefix = cli_sock.recv(7).decode()  # 最長 prefix 是 "weight:"，所以接收 7 個字節
+                print("Got prefix", prefix, len(prefix))
+                if not prefix:
+                    continue
+
+                # 取得傳來的參數
+                params_size = int.from_bytes(cli_sock.recv(4), 'big')
+                params_data = utils.receive_chunked_data(cli_sock)
+                params = pickle.loads(params_data)
+
+                if prefix.startswith('weight:'):
+                    print(f"Received weight parameters (len: {params_size}) from {cli_id}.")
+                    # ckks_params = ts.ckks_vector_from(, params)
+                    self.client_weights.append(params) # 加入等待聚合的 weight list 中
+                    cli_sock.sendall(b'ACK_W')
+                    got_weight = True
+                elif prefix.startswith('bias:'):
+                    print(f"Received bias parameters (len: {params_size}) from {cli_id}.")
+                    self.client_biases.append(params) # 加入等待聚合的 bias list 中
+                    cli_sock.sendall(b'ACK_B')
+                    got_bias = True
+                else:
+                    print("Unknown prefix:", prefix)
+        
+        except Exception as e:
+            print(f"Error handling client {cli_id}: {e}")
+
+        print(f"Client {cli_id}'s parameters are successfully received.")
 
     def start(self):
         self.init_sockets()
-        self.fetch_context()
-        client_count = 0
-
         for round_num in range(self.num_rounds):
-            self.client_params = {'weight': [], 'bias': []}
+            self.client_weights = []
+            self.client_biases = []
             client_threads = []
 
             print(f"Round {round_num + 1}: Waiting for clients to connect...")
@@ -76,25 +94,17 @@ class Server:
 
             # 等待所有客戶端線程完成
             for thread in client_threads:
-                thread.join()
-                client_count += 1
+                if thread != threading.current_thread():
+                    thread.join()
 
-                if client_count == self.num_clients:
-                    break
+            print(f"Round {round_num + 1}: Aggregating parameters...")
+            aggregated_weight = self.aggregate_encrypted_parameters(self.client_weights)
+            aggregatted_bias = self.aggregate_encrypted_parameters(self.client_biases)
+            print(f"Round {round_num + 1}: Aggregation completed.")
 
-            if client_count == self.num_clients:
-                print(f"Round {round_num + 1}: Aggregating parameters...")
-                aggregated_weight = self.aggregate_encrypted_parameters(self.client_params['weight'])
-                aggregatted_bias = self.aggregate_encrypted_parameters(self.client_params['bias'])
-                print(aggregated_weight, aggregatted_bias)
-                print(f"Round {round_num + 1}: Aggregation completed.")
-                self.send_encrypted_updates(aggregated_weight, aggregatted_bias)
-            else:
-                print("Not all clients sent their parameters. Skipping aggregation.")
-                
+
         # 回合結束後關閉 socket
         self.cli_socket.close()
-        self.kgc_socket.close()
 
 if __name__ == '__main__':
     with open('config.json', 'r') as config_file:
@@ -103,8 +113,7 @@ if __name__ == '__main__':
     server_config = config['server']
     train_config = config['train_config']
 
-    server = Server(server_config['client_host'], server_config['client_port'], 
-                    server_config['kgc_host'], server_config['kgc_port'],
+    server = Server(server_config['client_host'], server_config['client_port'],
                     train_config['num_rounds'], train_config['num_clients'])
 
     server.start()

@@ -44,12 +44,11 @@ def test(model, X_test, y_test, criterion):
     return loss.item(), accuracy
 
 class Client:
-    def __init__(self, serv_host: str, serv_port: int, kgc_host: str, kgc_port: int, num_rounds: int, num_clients: int, num_epochs: int):
+    def __init__(self, serv_host: str, serv_port: int, num_rounds: int, num_clients: int, num_epochs: int):
         """
         Initialization and configuration of the client.
 
         serv_sock: server socket, to send encrypted params to the central server
-        kgc_sock: key generation center socket, to receive public context and updated params
         config: training configuration data
         id: 8-digit unique client id
         context: public context to encrypt parameters
@@ -57,29 +56,37 @@ class Client:
         """
         self.serv_host = serv_host
         self.serv_port = serv_port
-        self.kgc_host = kgc_host
-        self.kgc_port = kgc_port
 
         self.num_rounds = num_rounds
         self.num_clients = num_clients
         self.num_epochs = num_epochs
 
         self.id = str(uuid.uuid4().hex)[:8]
-        self.context = None
         self.model = None
         self.init_sockets()
+        self.create_context()
 
     def init_sockets(self):
         self.serv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.serv_socket.connect((self.serv_host, self.serv_port))
 
-        self.kgc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.kgc_socket.connect((self.kgc_host, self.kgc_port))
-
-        # Send unique id to KGC and server
+        # Send unique id to the server
         uid_msg = pickle.dumps(self.id)
-        self.kgc_socket.sendall(uid_msg) # 傳送 unique id 給 key gen center
         self.serv_socket.sendall(uid_msg) # 傳送 unique id 給 server
+
+    def create_context(self) -> ts.Context:
+        poly_mod_degree = 8192  # 定義要使用的多項式模數次數，必須是2的冪次方，會影響加密效率和安全性
+        coeff_mod_bit_sizes = [30, 25, 25, 25, 25, 25, 25, 30]
+        context = ts.context(
+            scheme=ts.SCHEME_TYPE.CKKS, 
+            poly_modulus_degree=poly_mod_degree, 
+            coeff_mod_bit_sizes=coeff_mod_bit_sizes,
+            encryption_type=ts.ENCRYPTION_TYPE.ASYMMETRIC
+        )    
+        context.global_scale = 2 ** 25
+        context.generate_galois_keys()
+        context.make_context_public()
+        self.context = context
 
     def get_data(self):
         """
@@ -99,6 +106,9 @@ class Client:
         Train the model.
         """
         model = train(model, X, y, self.num_epochs, optimizer, criterion, 32)
+        
+        # Send params to the server after training
+        self.send_encrypted_updates(model)
         return model
 
     def evaluate(self, model, X_test, y_test, criterion):
@@ -108,25 +118,33 @@ class Client:
         test_loss, test_accuracy = test(model, X_test, y_test, criterion)
         print(f"Test Loss: {test_loss}, Test Accuracy: {test_accuracy}")
 
-    def fetch_context(self) -> ts.Context:
-        """ 
-        Get context size first and receive the public context from kgc. 
-        """
-        print("fetching context...")
-        self.context = utils.receive_public_context(self.kgc_socket)
-
     def send_encrypted_updates(self, model):
-        utils.send_updates(self.serv_socket, 'client', model.lr.weight.tolist()[0], 
-                           model.lr.bias.tolist(), to_encrypt=True, context=self.context)
+        # 加密參數
+        weight = ts.ckks_vector(self.context, model.lr.weight.tolist()[0])
+        bias = ts.ckks_vector(self.context, model.lr.bias.tolist())
+        
+        # 添加前綴以區分 weight 和 bias
+        weight_prefix = b'weight:'
+        bias_prefix = b'bias:'
 
-    def receive_global_model(self):
-        kgc_params = {'weight': None, 'bias': None}
-        utils.receive_parameters(self.kgc_socket, 'client', kgc_params=kgc_params)
-        with torch.no_grad():
-            self.model.lr.weight = torch.nn.Parameter(torch.tensor(kgc_params['weight']).float())
-            self.model.lr.bias = torch.nn.Parameter(torch.tensor(kgc_params['bias']).float())
-        return self.model
-    
+        # 將 weight 和 bias 序列化為字節流
+        weight_data = pickle.dumps(weight.serialize())
+        bias_data = pickle.dumps(bias.serialize())
+
+        ack_msg = {weight_prefix: b'ACK_W', bias_prefix: b'ACK_B'}
+        # 先傳送前綴和大小，再傳數據
+        for prefix, data in [(weight_prefix, weight_data), (bias_prefix, bias_data)]:
+            print(f"Sending params {prefix.decode()} ...")
+            self.serv_socket.send(prefix + len(data).to_bytes(4, 'big'))
+            utils.send_chunked_data(self.serv_socket, data)
+            ack = self.serv_socket.recv(5)
+            if ack != ack_msg[prefix]:
+                print(f"Error: Incorrect ACK received for {prefix.decode()}")
+            else:
+                print(f"Server received {prefix.decode()} params.")
+        print("Encrypted params sent to server")
+
+
 if __name__ == "__main__":
 
     # fit 5 個 round 就會有 50 了
@@ -135,29 +153,23 @@ if __name__ == "__main__":
     
     client_config = config['client']
     train_config = config['train_config']
+
+
     
     client = Client(client_config['server_host'], client_config['server_port'], 
-                client_config['kgc_host'], client_config['kgc_port'],
                 train_config['num_rounds'], train_config['num_clients'], client_config['num_epochs'])
 
     (X_train, y_train), (X_test, y_test) = client.get_data()
     n_features = X_train.shape[1]
     model = utils.BasicLR(n_features)
+    print(y_test.size(0))
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     criterion = torch.nn.BCELoss()
 
-    client.fetch_context()
     print("my context is public?", client.context.is_public())
 
-    for round in range(train_config['num_rounds']):
-        print(f"Starting training round {round + 1}")
+    model = client.fit(model, X_train, y_train, optimizer, criterion)
+    client.evaluate(model, X_test, y_test, criterion)
 
-        model = client.fit(model, X_train, y_train, optimizer, criterion)   
-        client.send_encrypted_updates(model)
-        model = client.receive_global_model()
-        client.evaluate(model, X_test, y_test, criterion)
-
-    
-    client.kgc_socket.close()
     client.serv_socket.close()

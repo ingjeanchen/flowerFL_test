@@ -1,0 +1,25 @@
+{
+    "server": {
+        "client_host": "localhost",
+        "client_port": 8080,
+        "kgc_host": "localhost",
+        "kgc_port": 8082
+    },
+    "client": {
+        "server_host": "localhost",
+        "server_port": 8080,
+        "kgc_host": "localhost",
+        "kgc_port": 8081,
+        "num_epochs": 10
+    },
+    "kgc": {
+        "client_host": "localhost",
+        "client_port": 8081,
+        "server_host": "localhost",
+        "server_port": 8082
+    },
+    "train_config": {
+        "num_rounds": 10,
+        "num_clients": 1
+    }
+}

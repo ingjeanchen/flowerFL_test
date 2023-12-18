@@ -253,18 +253,17 @@ def receive_parameters(socket: socket.socket, who_id: str, client_params=None, c
     try:
         while not(got_weight and got_bias):
             # 接收 prefix ，以區分 weight 和 bias
-            prefix = socket.recv(7).decode()  # 最長 prefix 是 "weight:"，所以接收 7 個字節
-            print("Got prefix", prefix, len(prefix))
+            prefix = socket.recv(7)  # 最長 prefix 是 "weight:"，所以接收 7 個字節
             if not prefix:
-                break
+                continue
+            prefix = prefix.decode()
 
             # 取得傳來的參數
-            params_size = int.from_bytes(socket.recv(4), 'big')
             params_data = receive_chunked_data(socket)
             params = pickle.loads(params_data)
 
-            if prefix.startswith('weight:'):
-                print(f"Received weight parameters (len: {params_size}) from {who_id}.")
+            if prefix.startswith('weight'):
+                print(f"Received weight parameters from {who_id}.")
                 
                 # server 處理 client 加密後的參數
                 if client_params and context:
@@ -281,8 +280,8 @@ def receive_parameters(socket: socket.socket, who_id: str, client_params=None, c
                 socket.sendall(b'ACK_W')
                 got_weight = True
 
-            elif prefix.startswith('bias:'):
-                print(f"Received bias parameters (len: {params_size}) from {who_id}.")
+            elif prefix.startswith('bias'):
+                print(f"Received bias parameters from {who_id}.")
                 
                 # server 處理 client 加密後的參數
                 if client_params and context:
@@ -309,18 +308,6 @@ def receive_parameters(socket: socket.socket, who_id: str, client_params=None, c
         else:
             print(f"Error handling Client {who_id}: {e}")
 
-    # kgc receive from server
-    if who_id == 'server':
-        print(f"Encrypted parameters are successfully received.")
-
-    # client receive from kgc
-    elif who_id == 'client':
-        print(f"Updated parameters are successfully received.")
-
-    # server receive from clients
-    else: 
-        print(f"Client {who_id}'s parameters are successfully received.")
-
 def send_updates(socket: socket.socket, role: str, weight, bias, to_encrypt=True, context=None, cli_id=''):
         # 加密參數
         if to_encrypt and context:
@@ -332,29 +319,42 @@ def send_updates(socket: socket.socket, role: str, weight, bias, to_encrypt=True
         bias_prefix = b'bias:'
 
         # 將 weight 和 bias 序列化為字節流
-        weight_data = pickle.dumps(weight.serialize())
-        bias_data = pickle.dumps(bias.serialize())
-        
+        if role != 'kgc':
+            weight_data = pickle.dumps(weight.serialize())
+            bias_data = pickle.dumps(bias.serialize())
+        else:
+            weight_data = pickle.dumps(weight)
+            bias_data = pickle.dumps(bias)
         ack_msg = {weight_prefix: b'ACK_W', bias_prefix: b'ACK_B'}
+        retry_limit = 10
+
         # 先傳送前綴和大小，再傳數據
         for prefix, data in [(weight_prefix, weight_data), (bias_prefix, bias_data)]:
-            print(f"Sending params {prefix.decode()[:-1]} ...")
-            socket.send(prefix + len(data).to_bytes(4, 'big'))
-            send_chunked_data(socket, data)
-            ack = socket.recv(5)
-
+            attempts = 0
             param_succ_msg = {'client': f"Server received {prefix.decode()[:-1]}.", 
-                       'server': f"KGC received {prefix.decode()[:-1]}.",
-                       'kgc': f"Client {cli_id} received updated {prefix.decode()[:-1]}."
-                        }
+                'server': f"KGC received {prefix.decode()[:-1]}.",
+                'kgc': f"Client {cli_id} received updated {prefix.decode()[:-1]}."
+                }
+            while attempts < retry_limit:
+                print(f"Attempt {attempts + 1}: Sending params {prefix.decode()[:-1]}...")
+                socket.sendall(prefix)
+                send_chunked_data(socket, data)
+                ack = socket.recv(5)
 
-            if ack != ack_msg[prefix]:
-                print(f"Error: Incorrect ACK received for {prefix.decode()}")
-            else:
-                print(param_succ_msg[role])
+                if ack == ack_msg[prefix]:
+                    print(f"{param_succ_msg[role]}")
+                    break
+                else:
+                    print(f"Warning: Incorrect ACK received for {prefix.decode()}. Retrying...")
+                    attempts += 1
+
+            if attempts == retry_limit:
+                print(f"Error: Failed to send {prefix.decode()[:-1]} after {retry_limit} attempts.")
+                return False  # Indicate failure after maximum attempts
 
         succ_msg = {'client': "Encrypted params sent to server.", 
                     'server': "Aggregated params sent to KGC.",
                     'kgc': f'Updated parameters sent to Client {cli_id}.'
                     }
         print(succ_msg[role])
+        return True

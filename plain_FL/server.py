@@ -1,6 +1,6 @@
 import socket
 import pickle
-import threading
+import time
 import tenseal as ts
 import json
 import utils
@@ -19,8 +19,6 @@ class Server:
         self.cli_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.cli_socket.bind((self.cli_host, self.cli_port))
         self.cli_socket.listen(self.num_clients) # client 數量要指定, 不可以變動
-        accept_timeout = 20
-        self.cli_socket.settimeout(accept_timeout)
 
         self.kgc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.kgc_socket.connect((self.kgc_host, self.kgc_port))  # 連接到 KGC   
@@ -29,6 +27,8 @@ class Server:
         aggregated = parameters_list[0]
         for params in parameters_list[1:]:
             aggregated += params
+        div = 1 / len(parameters_list)
+        aggregated = aggregated * div
         return aggregated
 
     def send_encrypted_updates(self, weight, bias):
@@ -41,46 +41,43 @@ class Server:
         self.context = utils.receive_public_context(self.kgc_socket)
 
     def handle_client(self, cli_sock: socket.socket, cli_id: str):
-        utils.receive_parameters(cli_sock, cli_id, self.client_params, self.context)
+        utils.receive_parameters(cli_sock, cli_id, client_params=self.client_params, context=self.context)
 
     def start(self):
         self.init_sockets()
-        self.fetch_context()
+        
         client_count = 0
 
         for round_num in range(self.num_rounds):
             self.client_params = {'weight': [], 'bias': []}
-            client_threads = []
+            client_count = 0
+            print(f"Round {round_num + 1} ===========")
+            self.fetch_context()
+            time.sleep(5)
+            print("Waiting for clients to connect...")
 
-            print(f"Round {round_num + 1}: Waiting for clients to connect...")
-
-            for _ in range(self.num_clients):
+            while client_count < self.num_clients:
                 try:
                     client_socket, client_address = self.cli_socket.accept()
 
                     # 得到 client 的 id
-                    client_id = client_socket.recv(32)
+                    client_id = client_socket.recv(64)
                     client_id = pickle.loads(client_id)
 
                     print(f"Client {client_address} connected, ID: {client_id}")
+                    
+                    ack = b'ACK_ID'
+                    client_socket.sendall(ack)
 
-                    cli_thread = threading.Thread(target=self.handle_client, args=(client_socket, client_id))
-                    cli_thread.start()
-                    client_threads.append(cli_thread)
-
+                    self.handle_client(client_socket, client_id)
+                    client_count += 1
+                    
                 except socket.timeout:
                     print("Client accept timeout.")
 
                 except Exception as e:
                     print(f"Error accepting client connection: {e}")
 
-            # 等待所有客戶端線程完成
-            for thread in client_threads:
-                thread.join()
-                client_count += 1
-
-                if client_count == self.num_clients:
-                    break
 
             if client_count == self.num_clients:
                 print(f"Round {round_num + 1}: Aggregating parameters...")

@@ -1,4 +1,5 @@
 import socket
+import time
 import tenseal as ts
 import numpy as np
 import utils
@@ -36,10 +37,13 @@ def train(model, X, y, epochs, optimizer, criterion, batch_size=32):
 def test(model, X_test, y_test, criterion):
     loss = 0
     with torch.no_grad():
-        pred = (model(X_test) > 0.5).float()
-        loss = criterion(pred, y_test)
+        out = model(X_test)
+        loss = criterion(out, y_test)
+        pred = (out > 0.5).float()
+
         correct = (pred == y_test).float()
         accuracy = correct.mean().item()
+        
     # loss = float("{:.2f}".format(loss.item()))
     return loss.item(), accuracy
 
@@ -67,19 +71,15 @@ class Client:
         self.id = str(uuid.uuid4().hex)[:8]
         self.context = None
         self.model = None
-        self.init_sockets()
+        self.connect_kgc()
 
-    def init_sockets(self):
-        self.serv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.serv_socket.connect((self.serv_host, self.serv_port))
-
+    def connect_kgc(self):
         self.kgc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.kgc_socket.connect((self.kgc_host, self.kgc_port))
 
-        # Send unique id to KGC and server
+        # Send unique id to KGC
         uid_msg = pickle.dumps(self.id)
         self.kgc_socket.sendall(uid_msg) # 傳送 unique id 給 key gen center
-        self.serv_socket.sendall(uid_msg) # 傳送 unique id 給 server
 
     def get_data(self):
         """
@@ -116,16 +116,31 @@ class Client:
         self.context = utils.receive_public_context(self.kgc_socket)
 
     def send_encrypted_updates(self, model):
-        utils.send_updates(self.serv_socket, 'client', model.lr.weight.tolist()[0], 
-                           model.lr.bias.tolist(), to_encrypt=True, context=self.context)
+        try:
+            self.serv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.serv_socket.connect((self.serv_host, self.serv_port))
 
-    def receive_global_model(self):
+            uid_msg = pickle.dumps(self.id)
+            self.serv_socket.sendall(uid_msg)
+            ack = self.serv_socket.recv(6)
+            if ack == b'ACK_ID':
+                print("server got id")
+                utils.send_updates(self.serv_socket, 'client', model.lr.weight.tolist()[0], 
+                            model.lr.bias.tolist(), to_encrypt=True, context=self.context)
+            
+        except Exception as e:
+            print(f"Error sending updates to server: {e}")
+
+        finally:
+            self.serv_socket.close()
+
+    def receive_global_model(self, model):
         kgc_params = {'weight': None, 'bias': None}
         utils.receive_parameters(self.kgc_socket, 'client', kgc_params=kgc_params)
         with torch.no_grad():
-            self.model.lr.weight = torch.nn.Parameter(torch.tensor(kgc_params['weight']).float())
-            self.model.lr.bias = torch.nn.Parameter(torch.tensor(kgc_params['bias']).float())
-        return self.model
+            model.lr.weight = torch.nn.Parameter(torch.tensor(kgc_params['weight']).float().unsqueeze(0))
+            model.lr.bias = torch.nn.Parameter(torch.tensor(kgc_params['bias']).float())
+        return model
     
 if __name__ == "__main__":
 
@@ -147,17 +162,15 @@ if __name__ == "__main__":
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     criterion = torch.nn.BCELoss()
 
-    client.fetch_context()
-    print("my context is public?", client.context.is_public())
+    print(model.lr.weight)
+    print(model.lr.bias)
 
     for round in range(train_config['num_rounds']):
         print(f"Starting training round {round + 1}")
-
+        client.fetch_context()
         model = client.fit(model, X_train, y_train, optimizer, criterion)   
         client.send_encrypted_updates(model)
-        model = client.receive_global_model()
+        model = client.receive_global_model(model)
         client.evaluate(model, X_test, y_test, criterion)
-
     
     client.kgc_socket.close()
-    client.serv_socket.close()

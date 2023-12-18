@@ -18,9 +18,7 @@ class KeyGenCenter():
         self.num_clients = num_clients
         self.cli_sockets = {}
         self.server_params = {'weight': None, 'bias': None}
-        self.lock = threading.Lock()
         self.sock = None
-        self.round_complete_event = threading.Event()
         self.clients_completed = 0
         self.server_completed = False
 
@@ -36,27 +34,6 @@ class KeyGenCenter():
         context.global_scale = 2 ** 25
         context.generate_galois_keys()
         return context
-
-    def reset_for_new_round(self):
-        with self.lock:
-            self.clients_completed = 0
-            self.server_completed = False
-            self.round_complete_event.clear()
-
-    def check_round_completion(self):
-        with self.lock:
-            if self.clients_completed == self.num_clients and self.server_completed:
-                self.round_complete_event.set()
-
-    def mark_client_as_completed(self):
-        with self.lock:
-            self.clients_completed += 1
-            self.check_round_completion()
-
-    def mark_as_server_completed(self):
-        with self.lock:
-            self.server_completed = True
-            self.check_round_completion()
 
     def send_public_context(self, conn: socket.socket, cli_id: str):
         ctx = self.context
@@ -76,43 +53,45 @@ class KeyGenCenter():
                 print("Server received the context")
             else:
                 print(f"Client {cli_id} received the context")
-    
-    def send_updated_params_to_clients(self):
-        print(self.cli_sockets)
-        for client_id, socket in self.cli_sockets.items():
-            print(f"Sending updated params to Client {client_id}...")
-            utils.send_updates(socket, 'kgc', self.server_params['weight'], 
-                               self.server_params['bias'], to_encrypt=False, cli_id=client_id)
-
-    def handle_client(self, cli_socket, client_id):
-        with self.lock:
-            try:
-                self.send_public_context(cli_socket, client_id)
-                self.mark_client_as_completed()
-            except EOFError as e:
-                logging.error(f"EOFError: {e}")
-            except Exception as e:
-                logging.error(f"Error in handle_client: {e}")
-
-    def handle_server(self, serv_sock: socket.socket):
-        self.send_public_context(serv_sock, 'server')
-        utils.receive_parameters(serv_sock, 'server', context=self.context, server_params=self.server_params)
+            return 1
         
-        # do averaging
-        self.server_params['weight'] = [w / self.num_clients for w in self.server_params['weight']]
-        self.server_params['bias'] = [w / self.num_clients for w in self.server_params['bias']]
+    def distribute_context(self):
+        print("Distributing context...")
+        # Create new context for the round
+        self.context = self.create_context()
 
-        self.mark_as_server_completed()
+        # Send context to all clients
+        for client_id, socket in self.cli_sockets.items():
+            self.send_public_context(socket, client_id)
+
+        # Send context to the server
+        self.send_public_context(self.server_conn, 'server')
+
+    def send_updated_params_to_clients(self):
+        for client_id, socket in self.cli_sockets.items():
+
+            print(f"Sending updated params to Client {client_id}...", self.server_params)
+            utils.send_updates(socket, 'kgc', self.server_params['weight'], 
+                               self.server_params['bias'], to_encrypt=False, cli_id=client_id)        
     
+    def reset_round(self):
+        self.clients_completed = 0
+        self.server_completed = False
+
     def start_rounds(self):
         for round_number in range(1, self.num_rounds + 1):
             print(f"Round {round_number} started")
-            self.reset_for_new_round()
-            self.context = self.create_context()  # Generate new keys for the round
+            self.reset_round()
 
-            self.round_complete_event.wait()  # Wait for all clients and server to complete the round
-            print("hello")
+            self.distribute_context()
+
+            while len(self.cli_sockets) < self.num_clients:
+                time.sleep(0.5)
+            
+            utils.receive_parameters(self.server_conn, 'server', context=self.context, server_params=self.server_params)
+
             self.send_updated_params_to_clients()
+            
             print(f"Round {round_number} completed")
 
     def start_client_listener(self):
@@ -129,45 +108,25 @@ class KeyGenCenter():
             client_id = pickle.loads(client_id)
             self.cli_sockets[client_id] = cli_socket
             print(f"Client ID [{client_id}] connected.")
-        
-        for cli_id, cli_socket in self.cli_sockets.items():
-            # Handle client connections in separate threads
-            cli_thread = threading.Thread(target=self.handle_client, args=(cli_socket, cli_id,))
-            cli_thread.start()
-
-        # Wait for all clients to complete their initial setup
-        with self.lock:
-            while self.clients_completed < self.num_clients:
-                time.sleep(1)
-
 
     def start_server_listener(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((self.serv_host, self.serv_port))
-        self.server_socket.listen(10)
+        self.server_socket.listen(self.num_clients)
 
         print("KGC listening for Server connection...")
 
-        while True:
-            server_socket, _ = self.server_socket.accept()
-            print("Server connected!")
-            serv_thread = threading.Thread(target=self.handle_server, args=(server_socket,))
-            serv_thread.start()
+        self.server_conn, _ = self.server_socket.accept()
+        print("Server connected!")
 
     def start(self):
-        # Starting client and server listeners
-        client_listener_thread = threading.Thread(target=self.start_client_listener)
-        server_listener_thread = threading.Thread(target=self.start_server_listener)
-
-        client_listener_thread.start()
-        server_listener_thread.start()
+        self.start_server_listener()
+        self.start_client_listener()
 
         self.start_rounds()
 
         # Stopping the Key Gen Center
         self.stop()
-        client_listener_thread.join()
-        server_listener_thread.join()
 
     def stop(self):
         self.server_socket.close()
